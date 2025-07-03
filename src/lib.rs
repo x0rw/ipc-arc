@@ -1,9 +1,8 @@
 use std::num::NonZero;
+use std::ops::Add;
 use std::ptr;
 
-use nix::libc::__c_anonymous_ptp_perout_request_2;
-use nix::sys::mman::{MapFlags, ProtFlags, mmap, munmap};
-use nix::unistd::close;
+use nix::sys::mman::{MapFlags, ProtFlags, mmap};
 use nix::{
     Error,
     fcntl::OFlag,
@@ -12,14 +11,17 @@ use nix::{
     unistd::ftruncate,
 };
 pub struct IpcArc<T> {
+    counter: *mut u32,
     ptr: *mut T,
 }
 impl<T> IpcArc<T> {
     pub fn new() -> Self {
         Self {
+            counter: std::ptr::null_mut(),
             ptr: std::ptr::null_mut(),
         }
     }
+
     pub fn open(&mut self, name: &str, val: T) -> Result<(), Error> {
         let fd = shm_open(
             name,
@@ -40,17 +42,36 @@ impl<T> IpcArc<T> {
                 0,
             )?
         };
+
         let nptr = addr.as_ptr() as *mut T;
-        self.ptr = nptr;
+
+        // mem layout off: 0
+        self.counter = nptr as *mut u32;
+        let counter_ptr = self.counter;
+        if self.read_counter() == 999 {
+            unsafe {
+                *counter_ptr = 0;
+            }
+        } else {
+            unsafe {
+                *counter_ptr = *counter_ptr + 1;
+            }
+        }
+        println!("count: {}", self.read_counter());
+        // offset 0 + size(u32)
+        self.ptr = unsafe { nptr.add(size_of::<u32>()) };
 
         Ok(())
+    }
+    fn read_counter(&self) -> u32 {
+        unsafe { ptr::read(self.counter as *mut u32) }
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use std::{thread, time::Duration};
+    use std::{ptr, thread, time::Duration};
 
     use nix::libc::fork;
 
@@ -58,6 +79,7 @@ mod tests {
     #[test]
     fn test() {
         let mut ins: IpcArc<u64> = IpcArc::new();
+
         ins.open("/hello", 43).unwrap();
 
         unsafe {
@@ -69,7 +91,7 @@ mod tests {
 
         let s = unsafe { fork() };
         if s == 0 {
-            thread::sleep(Duration::from_secs(4));
+            thread::sleep(Duration::from_secs(1));
 
             unsafe {
                 ptr::write(ins.ptr, 1111);
@@ -80,14 +102,14 @@ mod tests {
             let reference: &mut u64 = unsafe { &mut *ins.ptr };
             println!("re:{}", *reference);
         } else {
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(Duration::from_secs(2));
             println!("else: {s}");
             ins.open("/hello", 43).unwrap();
 
             let reference: &mut u64 = unsafe { &mut *ins.ptr };
 
             unsafe {
-                ptr::write(ins.ptr, 999);
+                ptr::write(ins.ptr, 88);
             }
             println!("re:{}", *reference);
         }
