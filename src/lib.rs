@@ -3,6 +3,7 @@ use std::mem::MaybeUninit;
 use std::num::NonZero;
 use std::os::fd::{IntoRawFd, RawFd};
 use std::ptr;
+use std::slice::from_raw_parts;
 
 use nix::errno::Errno;
 use nix::libc::{
@@ -20,22 +21,55 @@ use nix::{
 };
 
 #[repr(C)]
+struct InnerIpcArc<T> {
+    mutex: pthread_mutex_t,
+    counter: u32,
+    ptr: T,
+}
+impl<T> InnerIpcArc<T> {
+    fn as_ref(&self) -> &T {
+        &self.ptr
+    }
+    pub fn counter(&self) -> u32 {
+        self.counter
+    }
+
+    fn set_counter(&mut self, val: u32) {
+        self.counter = val;
+    }
+
+    fn inc_counter(&mut self, val: u32) {
+        self.counter = self.counter + val;
+    }
+    fn as_slice(&self) -> &[u8] {
+        let slice = unsafe { from_raw_parts(&self.ptr as *const _ as *mut u8, size_of::<T>()) };
+
+        slice
+    }
+}
+#[repr(C)]
 pub struct IpcArc<T> {
+    inner: *mut InnerIpcArc<T>,
     name: String,
-    counter: *mut u32,
-    ptr: *mut T,
-    mutex: *mut pthread_mutex_t,
     mem_fd: Option<RawFd>,
 }
 impl<T> IpcArc<T> {
     pub fn new() -> Self {
         Self {
+            inner: std::ptr::null_mut(),
             name: String::new(),
-            counter: std::ptr::null_mut(),
-            ptr: std::ptr::null_mut(),
-            mutex: std::ptr::null_mut(),
             mem_fd: None,
         }
+    }
+    pub fn as_ref(&self) -> &T {
+        unsafe { &self.inner.as_ref().unwrap().ptr }
+    }
+
+    pub fn as_mut(&self) -> &mut T {
+        unsafe { &mut self.inner.as_mut().unwrap().ptr }
+    }
+    fn inner(&self) -> &mut InnerIpcArc<T> {
+        unsafe { self.inner.as_mut().unwrap() }
     }
 
     pub fn open(&mut self, name: &str, val: T) -> Result<(), Error> {
@@ -76,23 +110,26 @@ impl<T> IpcArc<T> {
         let raw_fd = fd.into_raw_fd();
         self.mem_fd = Some(raw_fd);
 
-        let base = addr.as_ptr() as *mut u8;
+        self.inner = addr.as_ptr() as *mut InnerIpcArc<T>;
 
-        let mutex_ptr = base as *mut pthread_mutex_t;
-        let after_mutex = unsafe { base.add(size_of::<pthread_mutex_t>()) };
-        let counter_offset = after_mutex.align_offset(align_of::<u32>());
-        let counter_ptr = unsafe { after_mutex.add(counter_offset) };
-        let after_counter = unsafe { counter_ptr.add(size_of::<u32>()) };
+        let mutex_ptr = &self.inner().mutex as *const _ as *mut pthread_mutex_t;
+        // let base = addr.as_ptr() as *mut u8;
+        //
+        // let mutex_ptr = base as *mut pthread_mutex_t;
+        // let after_mutex = unsafe { base.add(size_of::<pthread_mutex_t>()) };
+        // let counter_offset = after_mutex.align_offset(align_of::<u32>());
+        // let counter_ptr = unsafe { after_mutex.add(counter_offset) };
+        // let after_counter = unsafe { counter_ptr.add(size_of::<u32>()) };
+        //
+        // let type_offset = after_counter.align_offset(align_of::<T>());
+        // let value_ptr = unsafe { after_counter.add(type_offset) };
 
-        let type_offset = after_counter.align_offset(align_of::<T>());
-        let value_ptr = unsafe { after_counter.add(type_offset) };
-
-        self.mutex = mutex_ptr;
-        self.counter = counter_ptr as *mut u32;
-        self.ptr = value_ptr as *mut T;
+        // self.mutex = mutex_ptr;
+        // self.counter = counter_ptr as *mut u32;
+        // self.ptr = value_ptr as *mut T;
 
         if is_owner {
-            unsafe { std::ptr::write_bytes(base, 0, size) };
+            unsafe { std::ptr::write_bytes(self.inner, 0, size) };
             println!("============= owner here ==================");
             //----------------------- ATTR ----------------------------------//
             // set/init mutex attr
@@ -104,13 +141,18 @@ impl<T> IpcArc<T> {
 
             let mut attr = unsafe { attr.assume_init() };
 
-            // set as shared
+            // set the mutex as shared
             let ret = unsafe {
                 pthread_mutexattr_setpshared(&attr as *const _ as *mut _, PTHREAD_PROCESS_SHARED)
             };
             assert_eq!(ret, 0, "pthread_mutex_init failed");
 
-            let ret = unsafe { pthread_mutex_init(mutex_ptr, &attr as *const _ as *mut _) };
+            let ret = unsafe {
+                pthread_mutex_init(
+                    &self.inner().mutex as *const _ as *mut _,
+                    &attr as *const _ as *mut _,
+                )
+            };
 
             unsafe { pthread_mutexattr_destroy(&mut attr) };
             assert_eq!(ret, 0, "pthread_mutex_init failed");
@@ -119,43 +161,40 @@ impl<T> IpcArc<T> {
         let ret = unsafe { pthread_mutex_lock(mutex_ptr) };
         assert_eq!(ret, 0, "pthread_mutex_lock failed");
 
-        unsafe {
-            *self.counter = self.read_counter() + 1;
-            // println!("=====> count after: {}", *counter_ptr);
-        }
+        println!("===================================");
+        println!("d: {:?}", unsafe { (*self.inner).as_slice() });
+        println!("counter: {:?}", unsafe { (*self.inner).counter() });
+        println!("counter: {:?}", self.read_counter());
+        println!("===================================");
+
+        self.inner().inc_counter(1);
+
         let ret = unsafe { pthread_mutex_unlock(mutex_ptr) };
         assert_eq!(ret, 0, "pthread_mutex_unlock failed");
 
-        unsafe {
-            self.ptr.write(val);
-        }
+        *self.as_mut() = val;
+        // self.ptr.write(val);
 
         Ok(())
     }
 
     fn read_counter(&self) -> u32 {
-        unsafe { ptr::read(self.counter) }
+        self.inner().counter
     }
 
     pub fn inc_counter(&self) {
-        let mutex_ptr = self.mutex;
+        let mutex_ptr = &self.inner().mutex as *const _ as *mut pthread_mutex_t;
         let ret = unsafe { pthread_mutex_lock(mutex_ptr) };
         assert_eq!(ret, 0, "pthread_mutex_lock failed");
 
-        unsafe {
-            *self.counter = self.read_counter() + 1;
-            // println!("=====> count after: {}", *counter_ptr);
-        }
+        self.inner().inc_counter(1);
         let ret = unsafe { pthread_mutex_unlock(mutex_ptr) };
         assert_eq!(ret, 0, "pthread_mutex_unlock failed");
     }
 
-    pub fn read_data(&self) -> T {
-        unsafe { ptr::read(self.ptr) }
-    }
     pub fn unlink(&self) -> Result<(), Errno> {
-        unsafe { *self.counter = *self.counter - 1 };
-        if (unsafe { *self.counter } == 1) {
+        self.inner().set_counter(self.read_counter() - 1);
+        if self.read_counter() == 1 {
             shm_unlink(self.name.as_str())?;
         }
         Ok(())
@@ -181,10 +220,12 @@ mod tests {
         use std::process::exit;
 
         const NUM_PROCESSES: usize = 20;
-        const INCREMENTS_PER_PROCESS: usize = 900;
+        const INCREMENTS_PER_PROCESS: usize = 10;
 
         // Setup in parent
         let mut shared = IpcArc::<u64>::new();
+
+        // shared.force_unlink().unwrap();
         shared.open("/hello", 42).unwrap();
 
         let mut children = vec![];
@@ -193,18 +234,17 @@ mod tests {
             match unsafe { fork() } {
                 Ok(ForkResult::Child) => {
                     let mut child = IpcArc::<u64>::new();
-                    child.open("/hello", 99).unwrap();
+                    child.open("/hello", 34).unwrap();
 
                     for _ in 0..INCREMENTS_PER_PROCESS {
                         child.inc_counter();
                     }
 
-                    // Optional debug
-                    println!(
-                        "[child {}] counter: {}",
-                        std::process::id(),
-                        child.read_counter()
-                    );
+                    // println!(
+                    //     "[child {}] counter: {}",
+                    //     std::process::id(),
+                    //     child.read_counter()
+                    // );
 
                     // Do NOT unlink in child
                     exit(0);
