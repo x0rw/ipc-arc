@@ -3,5 +3,16 @@ name = "ipc-arc"
 version = "0.1.0"
 edition = "2024"
 
+[profile.dev]
+debug = true
+opt-level = 0
+
 [dependencies]
 nix = { version = "0.30.1", features= ["mman", "fs" , "process"] }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "ipc_bench"
+harness = false
